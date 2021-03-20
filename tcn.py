@@ -112,7 +112,7 @@ class TCNTrainer(nn.Module):
         self.visu.train_losses.append(pred_loss.item())
         self.eval()
         
-        if not self._iter % 20 or self._iter == self.optim_iter:
+        if not self._iter % 30 or self._iter == self.optim_iter:
             with torch.no_grad():
                 if self.validation:
                     eval_loss = self._evaluate()
