@@ -60,10 +60,13 @@ def default_config():
     config.config = ''
     config.validation = True
     config.num_workers = 0
+    config.confidence_interval = 0.95
     # Data.
-    config.len_traj = 50
+    config.len_traj = 168
     config.recompute_label_stats = False
     # Model.
+    config.n_models = 2
+    config.output_pi = True
     config.net_type = '1d'
     config.init = 'kaiming'
     config.activation = 'relu'
@@ -72,8 +75,10 @@ def default_config():
     config.bias = False
     config.layers = 4
     config.dim_reduc = 'PCA'
+    config.dropout = 0.2
+    config.dilation = 1
     # Training.
-    config.optim_iter = 2
+    config.optim_iter = 1
     config.lr = 0.0005
     config.loss = 'MSE'
     config.grad_clip = 100.0
