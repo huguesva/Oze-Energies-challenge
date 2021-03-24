@@ -29,11 +29,13 @@ class TCNTrainer(nn.Module):
                 output_pi: bool,
                 dropout: float,
                 dilation: int,
-                n_models: int, 
+                n_models: int,
+                pearce: bool, 
                 **kwargs,
                 ):
         super().__init__()
-        
+
+        self.pearce = pearce
         self.n_models = n_models
         self.output_pi = output_pi
         self.models = [TCN(layers=layers, net_type=net_type, depth=depth, dilation=dilation, activation=activation, kernel=kernel, bias=bias,
@@ -49,17 +51,26 @@ class TCNTrainer(nn.Module):
         X = torch.load(self.data_dir+'/X.pt')
         X_test = torch.load(self.data_dir+'/X_test.pt')
         T = X.shape[-1]
-        l = 20*168
+        l = T
         Y = torch.load(self.data_dir+'/Y.pt').T
+
+        self.X_mean = X.mean(-1)
+        self.X_std = X.std(-1)
+
+        self.Y_mean = Y.mean(-1)
+        self.Y_std = Y.std(-1)
 
         self.X_train = torch.stack([torch.Tensor(X[:,t-self.len_traj:t]) for t in range(self.len_traj, l)], 0)
         self.Y_train = torch.stack([torch.Tensor(Y[:,t]) for t in range(self.len_traj, l)], 0)
 
-        self.X_eval = torch.stack([torch.Tensor(X[:,t-self.len_traj:t]) for t in range(l, T)], 0)
-        self.Y_eval = torch.stack([torch.Tensor(Y[:,t]) for t in range(l, T)], 0)
+        #self.X_eval = torch.stack([torch.Tensor(X[:,t-self.len_traj:t]) for t in range(l, T)], 0)
+        #self.Y_eval = torch.stack([torch.Tensor(Y[:,t]) for t in range(l, T)], 0)
 
         concat_X = torch.cat((X, X_test), -1)
         self.X_test = torch.stack([torch.Tensor(concat_X[:,-self.len_traj+t:t]) for t in range(-X_test.shape[-1], 0)], 0)
+
+        self.X_train = (self.X_train - self.X_mean.unsqueeze(-1)) / self.X_std.unsqueeze(-1)
+        self.X_test = (self.X_test - self.X_mean.unsqueeze(-1)) / self.X_std.unsqueeze(-1)
 
         self.init = init
         self.apply(self._init_weights)
@@ -73,6 +84,7 @@ class TCNTrainer(nn.Module):
         self.grad_clip = grad_clip
         self.eval_loss = 10e10
         self.validation = validation
+        self.counts = 0
 
     def fit(self):
         self.fitted = True
@@ -85,8 +97,9 @@ class TCNTrainer(nn.Module):
                 break
         self.visu.plot_losses()
         torch.save(self.saved_model, self.log_dir+'/saved_model.pt')
-        Y_test = self.TCN(self.X_test).detach().cpu().numpy()
-        with open('Y_test.npy', 'wb') as f:
+        lowers, uppers = self._generate_bounds(self.models[0], self.X_test)
+        Y_test = (torch.cat([torch.stack((lowers[:,i],uppers[:,i]),-1) for i in range(4)], -1)).detach().cpu().numpy()
+        with open(self.log_dir+'Y_test.npy', 'wb') as f:
             np.save(f, Y_test)
 
     def _init_weights(self, m):
@@ -114,17 +127,17 @@ class TCNTrainer(nn.Module):
         
         pred_losses = []
         for i in range(self.n_models):
-            if self.output_pi:     
+            if self.pearce:
                 pred_loss = self._pearce_loss(self.X_train, self.Y_train, self.models[i])
             else:
-                pred_loss = self.loss()(self.models[i](self.X_train), self.Y_train)
+                pred_loss = self.loss()(self.models[i](self.X_train), (self.Y_train-self.Y_mean.unsqueeze(0))/self.Y_std.unsqueeze(0))
             pred_losses.append(pred_loss)
 
             self.optims[i].zero_grad()
             pred_loss.backward()
             nn.utils.clip_grad_norm_(self.models[i].parameters(), self.grad_clip)
             self.optims[i].step()
-        pred_loss = mean(pred_losses)
+        pred_loss = sum(pred_losses)
 
         if self.scheduler is not None:
             self.scheduler.step()
@@ -134,20 +147,21 @@ class TCNTrainer(nn.Module):
 
         self.visu.train_losses.append(pred_loss.item())
         self.eval()
-        for m in self.TCN.modules():
-            if m.__class__.__name__.startswith('Dropout'):
-                m.train()
+        for i in range(self.n_models):
+            for m in self.models[i].modules():
+                if m.__class__.__name__.startswith('Dropout'):
+                    m.train()
         
-        if not self._iter % 30 or self._iter == self.optim_iter:
-            with torch.no_grad():
+        if not self._iter % 10 or self._iter == self.optim_iter:
                 if self.validation:
                     eval_loss = self._evaluate()
                     self.visu.eval_losses.append(eval_loss.item())
+                    self.visu.plot_losses()
                     if self.eval_loss > eval_loss:
                         self.eval_loss = eval_loss
                         self.saved_iter = self._iter
                         self.saved_model = self._clone_state_dict()
-                    elif self._iter - self.saved_iter >= 60:
+                    elif self._iter - self.saved_iter >= 100:
                         self.stop_training = True
                 else:
                     self._save_figs(batch, pred, embed)
@@ -155,7 +169,7 @@ class TCNTrainer(nn.Module):
 
         if pbar is not None:
             pbar.set_description(f'pred_loss: {float(pred_loss.item()): 4.2f}, '
-                #f'grad_norm: {float(gn): 4.2f}, '
+                f'counts in bounds: {float(self.counts): 4.2f}, '
                 f'validation_loss: {float(self.eval_loss): 4.2f}')
         
         self._iter += 1
@@ -164,31 +178,41 @@ class TCNTrainer(nn.Module):
     def _evaluate(self):
         pred_losses = []
         for i in range(self.n_models):
-            if self.output_pi:     
-                pred_loss = self._pearce_loss(self.X_eval, self.Y_eval, self.model[i])
-            else:
-                pred_loss = self.loss()(self.models[i](self.X_eval), self.Y_eval)
+            pred_loss = self._pearce_loss(self.X_train, self.Y_train, self.models[i])
             pred_losses.append(pred_loss)
-        return mean(pred_losses)
+        return sum(pred_losses)
 
     def _clone_state_dict(self):
         state_dict = self.state_dict()
         return {k: state_dict[k].clone() for k in state_dict}
 
     def _pearce_loss(self, X, Y, model):
+        self.counts = 0
         l = Y.shape[0]//168
         total_loss = 0
         for i in range(l): 
-            pred = model(X[i*168:(i+1)*168])
-            lowers = pred[:,[0,2,4,6]]
-            uppers = pred[:,[1,3,5,7]]
-            counts, diffs = 0, 0
-            for t in range(168):
-                bools = torch.logical_and(uppers[t]>Y[168*i+t],Y[t]>lowers[t])
-                diffs += (uppers[t] - lowers[t])@bools.float()
-                counts += int(bools.all())
-            total_loss += diffs/(counts+1e-5) + (168/(0.05*0.95))*torch.max(torch.Tensor([0, 0.95 - counts/168]))**2
-        return total_loss/l
+            lowers, uppers = self._generate_bounds(model, X[i*168:(i+1)*168])
+            bools = torch.logical_and(uppers>Y[168*i:(i+1)*168],Y[168*i:(i+1)*168]>lowers)
+            diffs = ((uppers - lowers)*bools.float()).sum()
+            counts = bools.all(-1).sum()
+            self.counts += counts/Y.shape[0]
+            total_loss += diffs/(counts+1e-6) + (168/(0.05*0.95))*(torch.max(torch.Tensor([0, 0.95 - counts/168]))**2)
+        return total_loss/Y.shape[0]
+
+    def _generate_bounds(self, model, X, N=20):
+        if self.pearce:
+            if self.output_pi:
+                pred = model(X)*torch.cat((self.Y_std,self.Y_std),-1).unsqueeze(0) + torch.cat((self.Y_mean,self.Y_mean),-1).unsqueeze(0)
+                return pred[:,[0,2,4,6]], pred[:,[1,3,5,7]]
+            else:
+                #Generate bounds with dropout
+                preds = torch.empty(N, X.shape[0], 4)
+                for i in range(N):
+                    preds[i] = model(X)*self.Y_std.unsqueeze(0) + self.Y_mean.unsqueeze(0)
+                return torch.quantile(preds, 0.5 - self.confidence_interval/2, dim=0), torch.quantile(preds, 0.5 + self.confidence_interval/2, dim=0)
+        else:
+            return model(X)*self.Y_std.unsqueeze(0) + self.Y_mean.unsqueeze(0) - 0.98*self.Y_std.unsqueeze(0), model(X)*self.Y_std + self.Y_mean + 0.98*self.Y_std.unsqueeze(0)
+
 
 class TCN(nn.Module):
     def __init__(self, layers=6, depth=256, activation='relu', kernel=5, bias=False, net_type='1d',
